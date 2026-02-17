@@ -1,0 +1,13 @@
+# Entorno virtual
+.venv/
+
+# Cache Python
+__pycache__/
+*.pyc
+
+# Base de datos local
+hv_locales.db
+*.db
+
+# PDFs generados
+*.pdf

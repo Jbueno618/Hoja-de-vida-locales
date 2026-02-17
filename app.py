@@ -27,7 +27,9 @@ def col_exists(conn, table: str, col: str) -> bool:
 
 def init_db():
     with get_conn() as conn:
+        # ---------------------------
         # Locales
+        # ---------------------------
         conn.execute("""
         CREATE TABLE IF NOT EXISTS stores (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -50,7 +52,9 @@ def init_db():
         if not col_exists(conn, "stores", "contact_phone_2"):
             conn.execute("ALTER TABLE stores ADD COLUMN contact_phone_2 TEXT;")
 
+        # ---------------------------
         # Pantallas
+        # ---------------------------
         conn.execute("""
         CREATE TABLE IF NOT EXISTS screens (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -71,7 +75,9 @@ def init_db():
             conn.execute(
                 "ALTER TABLE screens ADD COLUMN input_port TEXT NOT NULL DEFAULT 'HDMI1';")
 
+        # ---------------------------
         # Equipos
+        # ---------------------------
         conn.execute("""
         CREATE TABLE IF NOT EXISTS assets (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -87,18 +93,87 @@ def init_db():
         );
         """)
 
-        # Historial
-        conn.execute("""
-        CREATE TABLE IF NOT EXISTS history (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            store_id INTEGER NOT NULL,
-            date TEXT NOT NULL,
-            type TEXT NOT NULL,
-            responsible TEXT,
-            detail TEXT NOT NULL,
-            FOREIGN KEY (store_id) REFERENCES stores(id) ON DELETE CASCADE
-        );
-        """)
+        # ---------------------------
+        # Historial (Zoho-like) + migración desde estructura antigua
+        # ---------------------------
+        cur = conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='table' AND name='history';")
+        exists = cur.fetchone() is not None
+
+        if not exists:
+            conn.execute("""
+            CREATE TABLE IF NOT EXISTS history (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                store_id INTEGER NOT NULL,
+                ticket_code TEXT NOT NULL,                 -- ID ticket Zoho (ej: ZD-12345)
+                issue_date TEXT NOT NULL,                  -- fecha novedad
+                issue_desc TEXT NOT NULL,                  -- descripción novedad
+                resolution_date TEXT,                      -- fecha resolución (opcional)
+                resolution TEXT,                           -- resolución (opcional)
+                status TEXT NOT NULL DEFAULT 'Abierto',    -- Abierto/En proceso/Resuelto/Cerrado
+                technician TEXT,                           -- técnico responsable (opcional)
+                created_at TEXT NOT NULL,
+                FOREIGN KEY (store_id) REFERENCES stores(id) ON DELETE CASCADE
+            );
+            """)
+        else:
+            # Si existe, revisamos si es nueva (tiene ticket_code)
+            if not col_exists(conn, "history", "ticket_code"):
+                # Migrar vieja -> nueva (vieja: date/type/responsible/detail)
+                conn.execute("""
+                CREATE TABLE IF NOT EXISTS history_new (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    store_id INTEGER NOT NULL,
+                    ticket_code TEXT NOT NULL,
+                    issue_date TEXT NOT NULL,
+                    issue_desc TEXT NOT NULL,
+                    resolution_date TEXT,
+                    resolution TEXT,
+                    status TEXT NOT NULL DEFAULT 'Abierto',
+                    technician TEXT,
+                    created_at TEXT NOT NULL,
+                    FOREIGN KEY (store_id) REFERENCES stores(id) ON DELETE CASCADE
+                );
+                """)
+
+                conn.execute("""
+                INSERT INTO history_new (store_id, ticket_code, issue_date, issue_desc, status, technician, created_at)
+                SELECT
+                    store_id,
+                    'SIN-TICKET' as ticket_code,
+                    COALESCE(date, ?) as issue_date,
+                    COALESCE(detail, '') as issue_desc,
+                    'Abierto' as status,
+                    responsible as technician,
+                    ? as created_at
+                FROM history;
+                """, (datetime.now().date().isoformat(), datetime.now().isoformat()))
+
+                conn.execute("DROP TABLE history;")
+                conn.execute("ALTER TABLE history_new RENAME TO history;")
+            else:
+                # Ya está en formato nuevo: asegurar columnas por si faltan
+                if not col_exists(conn, "history", "issue_date"):
+                    conn.execute(
+                        "ALTER TABLE history ADD COLUMN issue_date TEXT NOT NULL DEFAULT '';")
+                if not col_exists(conn, "history", "issue_desc"):
+                    conn.execute(
+                        "ALTER TABLE history ADD COLUMN issue_desc TEXT NOT NULL DEFAULT '';")
+                if not col_exists(conn, "history", "resolution_date"):
+                    conn.execute(
+                        "ALTER TABLE history ADD COLUMN resolution_date TEXT;")
+                if not col_exists(conn, "history", "resolution"):
+                    conn.execute(
+                        "ALTER TABLE history ADD COLUMN resolution TEXT;")
+                if not col_exists(conn, "history", "status"):
+                    conn.execute(
+                        "ALTER TABLE history ADD COLUMN status TEXT NOT NULL DEFAULT 'Abierto';")
+                if not col_exists(conn, "history", "technician"):
+                    conn.execute(
+                        "ALTER TABLE history ADD COLUMN technician TEXT;")
+                if not col_exists(conn, "history", "created_at"):
+                    conn.execute(
+                        "ALTER TABLE history ADD COLUMN created_at TEXT NOT NULL DEFAULT '';")
 
         conn.commit()
 
@@ -112,6 +187,11 @@ def exec_sql(sql, params=()):
     with get_conn() as conn:
         conn.execute(sql, params)
         conn.commit()
+
+
+# Alias para no romper código que usa execute_query
+def execute_query(sql, params=()):
+    exec_sql(sql, params)
 
 
 # ---------------------------
@@ -138,10 +218,10 @@ def export_store_pdf(store_id: int, out_path: Path):
     """, (store_id,))
 
     hist = df_query("""
-        SELECT date, type, responsible, detail
+        SELECT ticket_code, issue_date, issue_desc, resolution_date, resolution, status, technician
         FROM history
         WHERE store_id = ?
-        ORDER BY date DESC, id DESC
+        ORDER BY issue_date DESC, id DESC
     """, (store_id,))
 
     c = canvas.Canvas(str(out_path), pagesize=A4)
@@ -247,7 +327,7 @@ def export_store_pdf(store_id: int, out_path: Path):
     y -= 18
 
     c.setFont("Helvetica-Bold", 12)
-    c.drawString(40, y, "4) Historial (Novedades / Visitas)")
+    c.drawString(40, y, "4) Historial (Novedades / Tickets)")
     y -= 16
     c.setFont("Helvetica", 9)
 
@@ -256,9 +336,18 @@ def export_store_pdf(store_id: int, out_path: Path):
         y -= 14
     else:
         for _, r in hist.iterrows():
-            txt = f"- {r['date']} | {r['type']} | Resp: {r.get('responsible') or '-'} | {r['detail']}"
+            txt = (
+                f"- Ticket: {r['ticket_code']} | {r['issue_date']} | Estado: {r['status']} | "
+                f"Téc: {r.get('technician') or '-'} | {r['issue_desc']}"
+            )
             c.drawString(40, y, safe(txt))
             y -= 12
+
+            if r.get("resolution"):
+                txt2 = f"  ↳ Resolución ({r.get('resolution_date') or '-'}) : {r['resolution']}"
+                c.drawString(40, y, safe(txt2))
+                y -= 12
+
             if y < 80:
                 c.showPage()
                 y = height - 60
@@ -319,7 +408,8 @@ def support_card_store(store_id: int):
             orientation AS Orientación,
             position AS Posición,
             input_port AS Entrada,
-            status AS Estado
+            status AS Estado,
+            notes AS Notas
         FROM screens
         WHERE store_id = ?
         ORDER BY id DESC
@@ -342,16 +432,19 @@ def support_card_store(store_id: int):
     """, (store_id,))
     st.dataframe(assets, use_container_width=True, hide_index=True)
 
-    st.markdown("### 🛠️ Historial")
+    st.markdown("### 🧾 Historial (Tickets)")
     hist = df_query("""
         SELECT
-            date AS Fecha,
-            type AS Tipo,
-            responsible AS Responsable,
-            detail AS Detalle
+            ticket_code AS Ticket,
+            issue_date AS Fecha_Novedad,
+            issue_desc AS Novedad,
+            resolution_date AS Fecha_Resolucion,
+            resolution AS Resolucion,
+            status AS Estado,
+            technician AS Tecnico
         FROM history
         WHERE store_id = ?
-        ORDER BY date DESC, id DESC
+        ORDER BY issue_date DESC, id DESC
     """, (store_id,))
     st.dataframe(hist, use_container_width=True, hide_index=True)
 
@@ -374,8 +467,6 @@ st.set_page_config(page_title="Hoja de Vida por Local", layout="wide")
 init_db()
 
 st.title("📌 Hoja de Vida por Local (Enmedio V.1 by J.B.)")
-
-stores_df = df_query("SELECT id, code, name FROM stores ORDER BY name")
 
 tab_creacion, tab_busqueda, tab_hv = st.tabs(
     ["🧾 Creación", "🔎 Búsqueda", "📘 Hoja de Vida (Editar)"])
@@ -484,6 +575,7 @@ with tab_creacion:
                 status = st.selectbox(
                     "Estado *", ["Operativo", "Con falla", "Retirado"])
                 a_notes = st.text_input("Notas (opcional)")
+
                 ok = st.form_submit_button("Agregar equipo")
                 if ok:
                     exec_sql("""
@@ -493,24 +585,46 @@ with tab_creacion:
                     st.success("Equipo agregado.")
                     st.rerun()
 
-        st.markdown("### 🛠️ Registrar historial")
-        with st.form("add_history", clear_on_submit=True):
-            date = st.date_input("Fecha", value=datetime.now().date())
-            htype = st.selectbox(
-                "Tipo", ["Novedad", "Visita", "Cambio de equipo", "Instalación", "Configuración"])
-            responsible = st.text_input("Responsable/Técnico")
-            detail = st.text_area("Detalle *", height=90)
-            ok = st.form_submit_button("Agregar al historial")
-            if ok:
-                if not detail.strip():
-                    st.error("El detalle es obligatorio.")
-                else:
-                    exec_sql("""
-                        INSERT INTO history (store_id, date, type, responsible, detail)
-                        VALUES (?, ?, ?, ?, ?)
-                    """, (store_id, date.isoformat(), htype, responsible, detail.strip()))
-                    st.success("Historial agregado.")
-                    st.rerun()
+        # st.markdown("### 🧾 Registrar historial (Zoho-like)")
+        # with st.form("add_history_zoho", clear_on_submit=True):
+        #     ticket_code = st.text_input(
+        #         "ID Ticket (Zoho) *", placeholder="Ej: ZD-12345")
+        #     issue_date = st.date_input(
+        #         "Fecha de la novedad", value=datetime.now().date())
+        #     issue_desc = st.text_area("Descripción de la novedad *", height=90)
+
+        #     status = st.selectbox(
+        #         "Estado", ["Abierto", "En proceso", "Resuelto", "Cerrado"])
+        #     technician = st.text_input("Técnico", placeholder="Ej: Juan Pérez")
+
+        #     resolution_date = st.date_input(
+        #         "Fecha de resolución (si aplica)", value=datetime.now().date())
+        #     resolution = st.text_area("Resolución (si aplica)", height=80)
+
+        #     ok = st.form_submit_button("Agregar al historial")
+        #     if ok:
+        #         if not ticket_code.strip():
+        #             st.error("El ID Ticket es obligatorio.")
+        #         elif not issue_desc.strip():
+        #             st.error("La descripción es obligatoria.")
+        #         else:
+        #             exec_sql("""
+        #                 INSERT INTO history
+        #                 (store_id, ticket_code, issue_date, issue_desc, resolution_date, resolution, status, technician, created_at)
+        #                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+        #             """, (
+        #                 store_id,
+        #                 ticket_code.strip(),
+        #                 issue_date.isoformat(),
+        #                 issue_desc.strip(),
+        #                 resolution_date.isoformat() if resolution.strip() else None,
+        #                 resolution.strip() if resolution.strip() else None,
+        #                 status,
+        #                 technician.strip() if technician.strip() else None,
+        #                 datetime.now().isoformat()
+        #             ))
+        #             st.success("Historial agregado ✅")
+        #             st.rerun()
 
 
 # =========================
@@ -537,7 +651,6 @@ with tab_busqueda:
             st.markdown("### Resultados")
             st.dataframe(results, use_container_width=True, hide_index=True)
 
-            # Selector para abrir la ficha completa de soporte
             st.markdown("### Abrir ficha de soporte")
             options = [
                 f"{r['code']} — {r['name']} (ID:{r['id']})" for _, r in results.iterrows()]
@@ -558,8 +671,11 @@ with tab_hv:
         st.info("Primero crea un local en la pestaña Creación.")
         st.stop()
 
-    sel = st.selectbox("Selecciona un local para ver/editar",
-                       [store_label(r) for _, r in stores_df.iterrows()], key="hv_store")
+    sel = st.selectbox(
+        "Selecciona un local para ver/editar",
+        [store_label(r) for _, r in stores_df.iterrows()],
+        key="hv_store"
+    )
     store_id = get_store_id_from_label(sel)
 
     # ---- Editar ficha del local
@@ -626,8 +742,9 @@ with tab_hv:
 
     st.divider()
 
-    # ---- Pantallas (ver + editar)
+    # ---- Pantallas (ver + editar + agregar)
     st.subheader("🖥️ Pantallas (Ver / Editar)")
+
     screens = df_query("""
         SELECT id, brand, reference, inches, orientation, position, input_port, status, notes
         FROM screens
@@ -635,61 +752,114 @@ with tab_hv:
         ORDER BY id DESC
     """, (store_id,))
 
-    st.dataframe(
-        screens.drop(columns=["id"]) if not screens.empty else screens,
-        use_container_width=True, hide_index=True
-    )
-
-    if screens.empty:
-        st.info("No hay pantallas registradas aún.")
+    if not screens.empty:
+        st.dataframe(
+            screens.drop(columns=["id"]),
+            use_container_width=True,
+            hide_index=True
+        )
     else:
+        st.info("No hay pantallas registradas aún.")
+
+    with st.expander("➕ Agregar nueva pantalla"):
+        new_brand = st.text_input("Marca *", key="new_brand")
+        new_reference = st.text_input(
+            "Referencia / Modelo *", key="new_reference")
+        new_inches = st.number_input(
+            "Pulgadas *", min_value=10, max_value=200, step=1, value=55, key="new_inches")
+        new_orientation = st.selectbox(
+            "Orientación *", ["Horizontal", "Vertical"], key="new_orientation")
+        new_position = st.text_input("Posición *", key="new_position")
+        new_input = st.selectbox(
+            "Entrada *", ["HDMI1", "HDMI2", "HDMI3", "DP"], key="new_input")
+        new_status = st.selectbox(
+            "Estado *", ["Operativa", "Con falla", "Retirada"], key="new_status")
+        new_notes = st.text_area(
+            "Notas (opcional)", key="new_notes", height=80)
+
+        if st.button("💾 Guardar nueva pantalla", key="btn_add_screen_hv"):
+            if not (new_brand.strip() and new_reference.strip() and new_position.strip()):
+                st.error("Marca, Referencia y Posición son obligatorios.")
+            else:
+                exec_sql("""
+                    INSERT INTO screens
+                    (store_id, brand, reference, inches, orientation, position, input_port, status, notes)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """, (
+                    store_id,
+                    new_brand.strip(),
+                    new_reference.strip(),
+                    int(new_inches),
+                    new_orientation,
+                    new_position.strip(),
+                    new_input,
+                    new_status,
+                    new_notes
+                ))
+                st.success("Pantalla agregada correctamente ✅")
+                st.rerun()
+
+    if not screens.empty:
         screen_sel = st.selectbox(
             "Selecciona una pantalla para editar/eliminar",
-            [f"ID {r['id']} — {r['brand']} {r['reference']} ({r['position']})" for _, r in screens.iterrows(
-            )],
+            [f"ID {r['id']} - {r['brand']} {r['reference']} ({r['position']})" for _,
+             r in screens.iterrows()],
             key="screen_edit"
         )
-        screen_id = int(screen_sel.split("—")[0].replace("ID", "").strip())
+        screen_id = int(screen_sel.split("-")[0].replace("ID", "").strip())
         sr = df_query("SELECT * FROM screens WHERE id = ?",
                       (screen_id,)).iloc[0].to_dict()
 
-        with st.form("edit_screen"):
-            brand = st.text_input("Marca *", value=sr["brand"])
-            reference = st.text_input(
-                "Referencia/Modelo *", value=sr["reference"])
-            inches = st.number_input(
-                "Pulgadas *", min_value=10, max_value=200, value=int(sr["inches"]), step=1)
-            orientation = st.selectbox(
-                "Orientación *", ["Horizontal", "Vertical"], index=0 if sr["orientation"] == "Horizontal" else 1)
-            position = st.text_input("Posición *", value=sr["position"])
-            input_port = st.selectbox("Entrada *", ["HDMI1", "HDMI2", "HDMI3", "DP"],
-                                      index=["HDMI1", "HDMI2", "HDMI3", "DP"].index(sr["input_port"]))
-            status = st.selectbox("Estado *", ["Operativa", "Con falla", "Retirada"],
-                                  index=["Operativa", "Con falla", "Retirada"].index(sr["status"]))
-            notes = st.text_input("Notas (opcional)",
-                                  value=sr.get("notes") or "")
+        st.markdown("### ✏️ Editar pantalla")
+        brand = st.text_input("Marca", sr["brand"], key="ed_brand")
+        reference = st.text_input(
+            "Referencia", sr["reference"], key="ed_reference")
+        inches = st.number_input("Pulgadas", min_value=10, max_value=200, value=int(
+            sr["inches"]), step=1, key="ed_inches")
+        orientation = st.selectbox(
+            "Orientación",
+            ["Horizontal", "Vertical"],
+            index=["Horizontal", "Vertical"].index(sr["orientation"]),
+            key="ed_orientation"
+        )
+        position = st.text_input("Posición", sr["position"], key="ed_position")
+        input_port = st.selectbox(
+            "Entrada",
+            ["HDMI1", "HDMI2", "HDMI3", "DP"],
+            index=["HDMI1", "HDMI2", "HDMI3", "DP"].index(
+                sr.get("input_port") or "HDMI1"),
+            key="ed_input"
+        )
+        status = st.selectbox(
+            "Estado",
+            ["Operativa", "Con falla", "Retirada"],
+            index=["Operativa", "Con falla", "Retirada"].index(sr["status"]),
+            key="ed_status"
+        )
+        notes = st.text_area("Notas", sr.get(
+            "notes") or "", key="ed_notes", height=80)
 
-            c1, c2 = st.columns(2)
-            save = c1.form_submit_button("💾 Guardar pantalla")
-            delete = c2.form_submit_button("🗑️ Eliminar pantalla")
-
-            if save:
+        col1, col2 = st.columns(2)
+        with col1:
+            if st.button("💾 Guardar cambios", key="btn_save_screen"):
                 exec_sql("""
                     UPDATE screens
-                    SET brand=?, reference=?, inches=?, orientation=?, position=?, input_port=?, status=?, notes=?
+                    SET brand=?, reference=?, inches=?, orientation=?,
+                        position=?, input_port=?, status=?, notes=?
                     WHERE id=?
                 """, (brand.strip(), reference.strip(), int(inches), orientation, position.strip(), input_port, status, notes, screen_id))
-                st.success("Pantalla actualizada.")
+                st.success("Pantalla actualizada ✅")
                 st.rerun()
 
-            if delete:
-                exec_sql("DELETE FROM screens WHERE id = ?", (screen_id,))
-                st.warning("Pantalla eliminada.")
+        with col2:
+            if st.button("🗑️ Eliminar pantalla", key="btn_del_screen"):
+                exec_sql("DELETE FROM screens WHERE id=?", (screen_id,))
+                st.warning("Pantalla eliminada")
                 st.rerun()
 
     st.divider()
 
-    # ---- Equipos (ver + editar)
+    # ---- Equipos (ver + editar + eliminar)
     st.subheader("🧰 Equipos (Ver / Editar)")
     assets = df_query("""
         SELECT id, asset_type, brand_model, serial, lot, position, status, notes
@@ -698,10 +868,11 @@ with tab_hv:
         ORDER BY id DESC
     """, (store_id,))
 
-    st.dataframe(
-        assets.drop(columns=["id"]) if not assets.empty else assets,
-        use_container_width=True, hide_index=True
-    )
+    if not assets.empty:
+        st.dataframe(assets.drop(columns=["id"]),
+                     use_container_width=True, hide_index=True)
+    else:
+        st.info("No hay equipos registrados aún.")
 
     if not assets.empty:
         asset_sel = st.selectbox(
@@ -717,6 +888,8 @@ with tab_hv:
         with st.form("edit_asset"):
             types = ["NUC", "Router", "Splitter",
                      "Player", "Controladora", "Switch", "Otro"]
+            statuses = ["Operativo", "Con falla", "Retirado"]
+
             asset_type = st.selectbox(
                 "Tipo *", types, index=types.index(ar["asset_type"]))
             brand_model = st.text_input(
@@ -725,7 +898,6 @@ with tab_hv:
             lot = st.text_input("Lote", value=ar.get("lot") or "")
             position = st.text_input(
                 "Posición", value=ar.get("position") or "")
-            statuses = ["Operativo", "Con falla", "Retirado"]
             status = st.selectbox("Estado *", statuses,
                                   index=statuses.index(ar["status"]))
             notes = st.text_input("Notas", value=ar.get("notes") or "")
@@ -750,73 +922,154 @@ with tab_hv:
 
     st.divider()
 
-    # ---- Historial (ver + agregar + editar)
-    st.subheader("🛠️ Historial (Ver / Editar)")
-    hist = df_query("""
-        SELECT id, date, type, responsible, detail
+    # ---- Historial (Zoho-like)
+    st.subheader("🧾 Historial de Soporte (Zoho-like)")
+
+    # Tabla
+    hist_tbl = df_query("""
+        SELECT
+            id,
+            ticket_code,
+            issue_date,
+            issue_desc,
+            resolution_date,
+            resolution,
+            status,
+            technician,
+            created_at
         FROM history
         WHERE store_id = ?
-        ORDER BY date DESC, id DESC
+        ORDER BY issue_date DESC, id DESC
     """, (store_id,))
 
-    st.dataframe(
-        hist.drop(columns=["id"]) if not hist.empty else hist,
-        use_container_width=True, hide_index=True
-    )
+    if not hist_tbl.empty:
+        st.dataframe(
+            hist_tbl.drop(columns=["id"]),
+            use_container_width=True,
+            hide_index=True
+        )
+    else:
+        st.info("No hay historial registrado aún.")
 
-    st.markdown("### Agregar registro al historial")
-    with st.form("add_history_hv", clear_on_submit=True):
-        date = st.date_input("Fecha", value=datetime.now().date())
-        htype = st.selectbox(
-            "Tipo", ["Novedad", "Visita", "Cambio de equipo", "Instalación", "Configuración"])
-        responsible = st.text_input("Responsable/Técnico")
-        detail = st.text_area("Detalle *", height=90)
-        ok = st.form_submit_button("Agregar")
-        if ok:
-            if not detail.strip():
-                st.error("El detalle es obligatorio.")
+    # Agregar nuevo
+    with st.expander("➕ Registrar novedad / ticket", expanded=False):
+        ticket_code = st.text_input(
+            "ID Ticket (Zoho) *", placeholder="Ej: ZD-12345", key="h_new_ticket")
+        issue_date = st.date_input(
+            "Fecha de la novedad *", value=datetime.now().date(), key="h_new_issue_date")
+        issue_desc = st.text_area(
+            "Descripción de la novedad *", height=120, key="h_new_issue_desc")
+
+        status = st.selectbox(
+            "Estado *", ["Abierto", "En proceso", "Resuelto", "Cerrado"], key="h_new_status")
+        technician = st.text_input(
+            "Técnico", placeholder="Ej: Juan Pérez", key="h_new_tech")
+
+        resolution_date = st.date_input(
+            "Fecha de resolución (si aplica)", value=datetime.now().date(), key="h_new_res_date")
+        resolution = st.text_area(
+            "Resolución (si aplica)", height=120, key="h_new_resolution")
+
+        if st.button("💾 Guardar novedad", key="h_btn_save_new"):
+            if not ticket_code.strip():
+                st.error("El ID Ticket (Zoho) es obligatorio.")
+            elif not issue_desc.strip():
+                st.error("La descripción de la novedad es obligatoria.")
             else:
                 exec_sql("""
-                    INSERT INTO history (store_id, date, type, responsible, detail)
-                    VALUES (?, ?, ?, ?, ?)
-                """, (store_id, date.isoformat(), htype, responsible, detail.strip()))
-                st.success("Agregado.")
+                    INSERT INTO history
+                    (store_id, ticket_code, issue_date, issue_desc, resolution_date, resolution, status, technician, created_at)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """, (
+                    store_id,
+                    ticket_code.strip(),
+                    issue_date.isoformat(),
+                    issue_desc.strip(),
+                    resolution_date.isoformat() if resolution.strip() else None,
+                    resolution.strip() if resolution.strip() else None,
+                    status,
+                    technician.strip() if technician.strip() else None,
+                    datetime.now().isoformat()
+                ))
+                st.success("Novedad guardada ✅")
                 st.rerun()
 
-    if not hist.empty:
-        hist_sel = st.selectbox(
-            "Selecciona un registro del historial para editar/eliminar",
-            [f"ID {r['id']} — {r['date']} {r['type']} ({(r.get('responsible') or '-')})" for _,
-             r in hist.iterrows()],
-            key="hist_edit"
-        )
-        hist_id = int(hist_sel.split("—")[0].replace("ID", "").strip())
-        hr = df_query("SELECT * FROM history WHERE id = ?",
-                      (hist_id,)).iloc[0].to_dict()
+    # Editar / eliminar
+    if not hist_tbl.empty:
+        st.markdown("### ✏️ Editar / Eliminar ticket")
 
-        with st.form("edit_history"):
-            date = st.text_input("Fecha (YYYY-MM-DD)", value=hr["date"])
-            types = ["Novedad", "Visita", "Cambio de equipo",
-                     "Instalación", "Configuración"]
-            htype = st.selectbox("Tipo", types, index=types.index(hr["type"]))
-            responsible = st.text_input(
-                "Responsable", value=hr.get("responsible") or "")
-            detail = st.text_area("Detalle *", value=hr["detail"], height=90)
+        pick = st.selectbox(
+            "Selecciona un ticket",
+            [f"ID {r['id']} — {r['ticket_code']} ({r['issue_date']})" for _,
+             r in hist_tbl.iterrows()],
+            key="h_pick_edit"
+        )
+        h_id = int(pick.split("—")[0].replace("ID", "").strip())
+        hr = df_query("SELECT * FROM history WHERE id = ?",
+                      (h_id,)).iloc[0].to_dict()
+
+        with st.form("h_edit_form"):
+            ticket_code_e = st.text_input(
+                "ID Ticket (Zoho) *", value=hr["ticket_code"])
+            issue_date_e = st.date_input("Fecha de la novedad *", value=datetime.fromisoformat(
+                hr["issue_date"]).date() if hr["issue_date"] else datetime.now().date())
+            issue_desc_e = st.text_area(
+                "Descripción de la novedad *", value=hr["issue_desc"], height=120)
+
+            status_e = st.selectbox("Estado *", ["Abierto", "En proceso", "Resuelto", "Cerrado"],
+                                    index=["Abierto", "En proceso", "Resuelto", "Cerrado"].index(hr["status"] if hr["status"] else "Abierto"))
+            technician_e = st.text_input(
+                "Técnico", value=hr.get("technician") or "")
+
+            # resolución (puede venir None)
+            res_date_default = datetime.now().date()
+            if hr.get("resolution_date"):
+                try:
+                    res_date_default = datetime.fromisoformat(
+                        hr["resolution_date"]).date()
+                except Exception:
+                    res_date_default = datetime.now().date()
+
+            resolution_date_e = st.date_input(
+                "Fecha de resolución (si aplica)", value=res_date_default)
+            resolution_e = st.text_area(
+                "Resolución (si aplica)", value=hr.get("resolution") or "", height=120)
 
             c1, c2 = st.columns(2)
-            save = c1.form_submit_button("💾 Guardar historial")
-            delete = c2.form_submit_button("🗑️ Eliminar historial")
+            save_h = c1.form_submit_button("💾 Guardar cambios")
+            del_h = c2.form_submit_button("🗑️ Eliminar ticket")
 
-            if save:
-                exec_sql("""
-                    UPDATE history
-                    SET date=?, type=?, responsible=?, detail=?
-                    WHERE id=?
-                """, (date.strip(), htype, responsible, detail.strip(), hist_id))
-                st.success("Historial actualizado.")
-                st.rerun()
+            if save_h:
+                if not ticket_code_e.strip():
+                    st.error("El ID Ticket es obligatorio.")
+                elif not issue_desc_e.strip():
+                    st.error("La descripción es obligatoria.")
+                else:
+                    exec_sql("""
+                        UPDATE history
+                        SET
+                            ticket_code=?,
+                            issue_date=?,
+                            issue_desc=?,
+                            resolution_date=?,
+                            resolution=?,
+                            status=?,
+                            technician=?
+                        WHERE id=?
+                    """, (
+                        ticket_code_e.strip(),
+                        issue_date_e.isoformat(),
+                        issue_desc_e.strip(),
+                        resolution_date_e.isoformat() if resolution_e.strip() else None,
+                        resolution_e.strip() if resolution_e.strip() else None,
+                        status_e,
+                        technician_e.strip() if technician_e.strip() else None,
+                        h_id
+                    ))
+                    st.success("Ticket actualizado ✅")
+                    st.rerun()
 
-            if delete:
-                exec_sql("DELETE FROM history WHERE id = ?", (hist_id,))
-                st.warning("Historial eliminado.")
+            if del_h:
+                exec_sql("DELETE FROM history WHERE id = ?", (h_id,))
+                st.warning("Ticket eliminado.")
                 st.rerun()
