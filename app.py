@@ -536,31 +536,51 @@ with tab_creacion:
             st.markdown("### 🖥️ Agregar pantalla")
             with st.form("add_screen", clear_on_submit=True):
                 brand = st.text_input("Marca *", placeholder="LG")
-                reference = st.text_input(
-                    "Referencia/Modelo *", placeholder="49UH5F")
-                inches = st.number_input(
-                    "Pulgadas *", min_value=10, max_value=200, value=55, step=1)
-                orientation = st.selectbox(
-                    "Orientación *", ["Horizontal", "Vertical"])
-                position = st.text_input(
-                    "Posición *", placeholder="muro caja / entrada / pilar norte")
-                input_port = st.selectbox(
-                    "Entrada *", ["HDMI1", "HDMI2", "HDMI3", "DP"])
-                status = st.selectbox(
-                    "Estado *", ["Operativa", "Con falla", "Retirada"])
+                reference = st.text_input("Referencia/Modelo *", placeholder="49UH5F")
+                inches = st.number_input("Pulgadas *", min_value=10, max_value=200, value=55, step=1)
+                orientation = st.selectbox("Orientación *", ["Horizontal", "Vertical"])
+                position = st.text_input("Posición base *", placeholder="muro caja / videowall entrada")
+        
+                input_port = st.selectbox("Entrada *", ["HDMI1", "HDMI2", "HDMI3", "DP"])
+                status = st.selectbox("Estado *", ["Operativa", "Con falla", "Retirada"])
                 s_notes = st.text_input("Notas (opcional)")
-
-                ok = st.form_submit_button("Agregar pantalla")
+        
+                qty = st.number_input("Cantidad", min_value=1, max_value=50, value=1, step=1)
+        
+                numerar = st.checkbox("Numerar posición automáticamente", value=True)
+        
+                ok = st.form_submit_button("Agregar pantalla(s)")
+        
                 if ok:
                     if not (brand.strip() and reference.strip() and position.strip()):
-                        st.error(
-                            "Marca, Referencia y Posición son obligatorios.")
+                        st.error("Marca, Referencia y Posición son obligatorios.")
                     else:
-                        exec_sql("""
-                            INSERT INTO screens (store_id, brand, reference, inches, orientation, position, input_port, status, notes)
-                            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-                        """, (store_id, brand.strip(), reference.strip(), int(inches), orientation, position.strip(), input_port, status, s_notes))
-                        st.success("Pantalla agregada.")
+                        for i in range(1, qty + 1):
+        
+                            if numerar and qty > 1:
+                                final_position = f"{position.strip()} {i}"
+                            else:
+                                final_position = position.strip()
+        
+                            exec_sql("""
+                                INSERT INTO screens (
+                                    store_id, brand, reference, inches,
+                                    orientation, position, input_port, status, notes
+                                )
+                                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                            """, (
+                                store_id,
+                                brand.strip(),
+                                reference.strip(),
+                                int(inches),
+                                orientation,
+                                final_position,
+                                input_port,
+                                status,
+                                s_notes
+                            ))
+        
+                        st.success(f"✅ Se agregaron {qty} pantalla(s) correctamente.")
                         st.rerun()
 
         with c2:
